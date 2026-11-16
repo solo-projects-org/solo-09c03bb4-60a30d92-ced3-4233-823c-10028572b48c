@@ -1,0 +1,56 @@
+services:
+  webapp:
+    build: .
+    image: transit-platform:latest
+    command: >
+      sh -c "uvicorn webapp.main:app --host 0.0.0.0 --port 8000"
+    environment:
+      APP_DB_PATH: /data/webapp.db
+      GATEWAY_URL: http://gateway:8001/gtfs-rt
+      SIGN_URL: http://sign:8002
+      POLL_INTERVAL: "3"
+      PUSH_RETRY_INTERVAL: "3"
+      HTTP_TIMEOUT: "5"
+      BACKGROUND_WORKERS: "1"
+    ports:
+      - "8000:8000"
+    volumes:
+      - webapp_data:/data
+    depends_on:
+      - gateway
+      - sign
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/sync',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    image: transit-platform:latest
+    command: uvicorn gateway.app:app --host 0.0.0.0 --port 8001
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8001/admin/state',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  sign:
+    image: transit-platform:latest
+    command: uvicorn sign.app:app --host 0.0.0.0 --port 8002
+    environment:
+      SIGN_DB_PATH: /data/sign.db
+    ports:
+      - "8002:8002"
+    volumes:
+      sign_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8002/health',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  webapp_data:
+  sign_data:

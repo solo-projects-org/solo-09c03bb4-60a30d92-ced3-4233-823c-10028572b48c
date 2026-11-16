@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>站牌实际生效内容（独立服务）</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; margin:0; background:#0d1117; color:#e6edf3; }
+  header { padding:14px 24px; border-bottom:1px solid #30363d; }
+  h1 { margin:0; font-size:17px; }
+  main { padding:18px 24px; max-width:1200px; margin:0 auto; }
+  .meta { font-size:13px; color:#8b949e; margin-bottom:14px; display:flex; gap:20px; flex-wrap:wrap; }
+  .meta b { color:#e6edf3; }
+  details { border:1px solid #30363d; border-radius:8px; margin-bottom:8px; padding:8px 12px; background:#161b22; }
+  summary { cursor:pointer; font-weight:600; }
+  table { border-collapse:collapse; width:100%; font-size:12.5px; margin-top:8px; }
+  th, td { border:1px solid #30363d; padding:5px 8px; text-align:left; white-space:nowrap; }
+  th { background:#21262d; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; }
+  .b-PREDICTED { background:#1a7f37; color:#fff; }
+  .b-PENDING { background:#9a6700; color:#fff; }
+  .b-SKIPPED { background:#57606a; color:#fff; }
+  .b-CANCELLED { background:#cf222e; color:#fff; }
+  .cancel { color:#ff7b72; font-weight:700; }
+  .mono { font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .empty { color:#8b949e; padding:40px; text-align:center; }
+  button { background:#21262d; color:#e6edf3; border:1px solid #30363d; border-radius:6px; padding:5px 12px; cursor:pointer; }
+</style>
+</head>
+<body>
+<header><h1>🪧 站牌实际生效内容（独立持久化服务 :8002）</h1></header>
+<main>
+  <div class="meta">
+    <span>本页数据直接来自站牌自身数据库，与采集网页无关。</span>
+    <button onclick="load()">刷新</button>
+    <label style="color:#8b949e"><input type="checkbox" id="auto" onchange="toggle()"> 3 秒自动刷新</label>
+  </div>
+  <div id="box"><div class="empty">加载中…</div></div>
+</main>
+<script>
+let t=null;
+function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function badge(s){ return `<span class="badge b-${esc(s)}">${esc(s)}</span>`; }
+async function load(){
+  const r = await fetch('/state');
+  const box = document.getElementById('box');
+  if(r.status===404){ box.innerHTML='<div class="empty">站牌尚无生效内容（等待首次推送）</div>'; return; }
+  const j = await r.json();
+  box.innerHTML = `
+    <div class="meta">
+      <span>生效版本 <b>${j.version}</b></span>
+      <span>header_ts <b class="mono">${j.header_ts ?? '—'}</b></span>
+      <span>服务日 <b>${j.service_date ?? '—'}</b></span>
+      <span>幂等键 <b class="mono">${esc(j._idempotency_key)}</b></span>
+      <span>内容哈希 <b class="mono">${esc((j.content_hash||'').slice(0,16))}…</b></span>
+      <span>落库时间 <b class="mono">${new Date(j._stored_at*1000).toISOString()}</b></span>
+      <span>班次 <b>${j.trips.length}</b></span>
+    </div>` + j.trips.map(tr => `
+    <details ${tr.cancelled ? '' : 'open'}>
+      <summary>班次 <span class="mono">${esc(tr.trip_id)}</span> ${tr.cancelled?'<span class="cancel">整班取消</span>':''}</summary>
+      <table><thead><tr><th>站序</th><th>站号</th><th>计划(UTC)</th><th>状态</th><th>预计到达</th><th>预计发车</th><th>不确定度</th></tr></thead>
+      <tbody>${tr.stops.map(s=>`<tr><td>${s.stop_sequence}</td><td class="mono">${esc(s.stop_code)}</td>
+        <td class="mono">${esc(s.scheduled_time)}</td><td>${badge(s.status)}</td>
+        <td class="mono">${esc(s.arrival_iso||'—')}</td><td class="mono">${esc(s.departure_iso||'—')}</td>
+        <td>${s.uncertainty??'—'}</td></tr>`).join('')}</tbody></table>
+    </details>`).join('');
+}
+function toggle(){ if(document.getElementById('auto').checked){ t=setInterval(load,3000);} else {clearInterval(t);t=null;} }
+load();
+</script>
+</body>
+</html>

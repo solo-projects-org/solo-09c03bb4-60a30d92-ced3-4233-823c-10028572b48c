@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>公交逐站预计到站平台</title>
+<style>
+  :root { --bd:#d0d7de; --bg:#f6f8fa; --blue:#0969da; --red:#cf222e; --green:#1a7f37; --amber:#9a6700; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; margin:0; color:#1f2328; }
+  header { background:#0d1117; color:#fff; padding:14px 24px; }
+  header h1 { margin:0; font-size:18px; }
+  main { padding:20px 24px; max-width:1280px; margin:0 auto; }
+  .card { border:1px solid var(--bd); border-radius:8px; padding:16px; margin-bottom:18px; background:#fff; }
+  .card h2 { margin:0 0 12px; font-size:16px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  button { border:1px solid var(--bd); background:var(--bg); border-radius:6px; padding:6px 14px; cursor:pointer; font-size:13px; }
+  button:hover { background:#eaeef2; }
+  button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
+  input[type=text], input[type=file] { font-size:13px; padding:5px 8px; border:1px solid var(--bd); border-radius:6px; }
+  table { border-collapse:collapse; width:100%; font-size:12.5px; }
+  th, td { border:1px solid var(--bd); padding:5px 8px; text-align:left; white-space:nowrap; }
+  th { background:var(--bg); position:sticky; top:0; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:600; }
+  .b-PREDICTED { background:#dafbe1; color:var(--green); }
+  .b-PENDING { background:#fff8c5; color:var(--amber); }
+  .b-SKIPPED { background:#f6f8fa; color:#57606a; }
+  .b-CANCELLED { background:#ffebe9; color:var(--red); }
+  .b-OK { background:#dafbe1; color:var(--green); }
+  .b-ERROR { background:#ffebe9; color:var(--red); }
+  .b-NO_DATA { background:#f6f8fa; color:#57606a; }
+  .b-CONFIRMED { background:#dafbe1; color:var(--green); }
+  .b-PENDING2, .b-IN_FLIGHT, .b-PENDING { background:#fff8c5; color:var(--amber); }
+  .b-FAILED { background:#ffebe9; color:var(--red); }
+  .b-SUPERSEDED { background:#f6f8fa; color:#57606a; }
+  .kv { display:grid; grid-template-columns: repeat(auto-fill,minmax(230px,1fr)); gap:6px 18px; font-size:13px; }
+  .kv b { color:#57606a; font-weight:500; }
+  .stale { background:#ffebe9; border-color:var(--red); }
+  .muted { color:#57606a; font-size:12px; }
+  .err { color:var(--red); font-size:13px; margin-top:8px; white-space:pre-wrap; }
+  details { margin-top:8px; }
+  summary { cursor:pointer; font-weight:600; font-size:13px; }
+  .mono { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; }
+  .flex2 { display:flex; gap:18px; flex-wrap:wrap; }
+  .flex2 > div { flex:1; min-width:380px; }
+  .trip-cancel { color:var(--red); font-weight:700; }
+  a { color:var(--blue); }
+</style>
+</head>
+<body>
+<header><h1>公交逐站预计到站 · 数据整理平台（UTC 单日）</h1></header>
+<main>
+  <section class="card">
+    <h2>1. 上传单日 UTC 计划 CSV</h2>
+    <div class="row">
+      <input type="file" id="csvfile" accept=".csv,text/csv">
+      <label class="muted">服务日期(可选, YYYY-MM-DD): <input type="text" id="svcdate" placeholder="留空则从时刻推断"></label>
+      <button class="primary" onclick="uploadCsv()">上传</button>
+    </div>
+    <div id="uploadmsg" class="muted" style="margin-top:8px">
+      列名支持 trip_id/班次、stop_sequence/站序、stop_code/站号、scheduled_time/计划时刻；时刻支持 HH:MM:SS、ISO-8601、epoch 秒。
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>2. 同步状态（本地最新 vs 站牌实际生效）</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button onclick="refreshSync()">刷新</button>
+      <button onclick="postAction('/api/poll-now')">立即拉取一次</button>
+      <button onclick="postAction('/api/reconcile-now')">立即对账站牌</button>
+      <button onclick="postAction('/api/push-now')">立即推送一次</button>
+      <label class="muted"><input type="checkbox" id="autorefresh" onchange="toggleAuto()"> 每 3 秒自动刷新</label>
+      <a id="signlink" href="#" target="_blank" style="margin-left:auto">↗ 在新窗口查看站牌实际内容</a>
+    </div>
+    <div id="syncbox" class="kv muted">尚未加载</div>
+    <div class="flex2">
+      <div>
+        <details open><summary>快照历史（拒绝/应用）</summary>
+          <table id="snaptbl"><thead><tr><th>版本</th><th>应用</th><th>header_ts(UTC)</th><th>实体</th><th>忽略</th><th>原因</th><th>接收时间</th></tr></thead><tbody></tbody></table>
+        </details>
+      </div>
+      <div>
+        <details open><summary>推送尝试（含丢回执/重试）</summary>
+          <table id="pushtbl"><thead><tr><th>ID</th><th>版本</th><th>状态</th><th>HTTP</th><th>幂等键</th><th>错误</th><th>更新时间</th></tr></thead><tbody></tbody></table>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>3. 逐站预计明细与依据</h2>
+    <div id="triphead" class="muted" style="margin-bottom:8px"></div>
+    <div id="trips"></div>
+  </section>
+</main>
+
+<script>
+const SIGN_BASE = (location.origin.replace(/:\d+$/, '') || '') + ':8002';
+document.getElementById('signlink').href = SIGN_BASE + '/';
+let timer = null;
+
+function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function fmtTs(ts){ if(ts==null) return '—'; return new Date(ts*1000).toISOString().replace('T',' ').replace('Z',' UTC'); }
+function badge(s){ return `<span class="badge b-${esc(s)}">${esc(s)}</span>`; }
+
+async function uploadCsv(){
+  const f = document.getElementById('csvfile').files[0];
+  if(!f){ alert('请选择 CSV 文件'); return; }
+  const fd = new FormData();
+  fd.append('file', f);
+  fd.append('service_date', document.getElementById('svcdate').value);
+  const msg = document.getElementById('uploadmsg');
+  msg.className='muted'; msg.textContent='上传中…';
+  try{
+    const r = await fetch('/api/schedule', {method:'POST', body:fd});
+    const j = await r.json();
+    if(!r.ok) throw new Error(j.detail || r.status);
+    msg.className=''; msg.innerHTML = `✅ 已载入服务日 <b>${j.service_date}</b>，${j.row_count} 行 / ${j.trip_count} 个班次，旧实时与推送状态已重置。`;
+    refreshAll();
+  }catch(e){ msg.className='err'; msg.textContent='❌ '+e.message; }
+}
+
+async function postAction(url){
+  try{
+    const r = await fetch(url, {method:'POST'});
+    const j = await r.json();
+    console.log(url, j);
+  }catch(e){ console.error(e); }
+  refreshAll();
+}
+
+function toggleAuto(){
+  if(document.getElementById('autorefresh').checked){ timer = setInterval(refreshAll, 3000); }
+  else { clearInterval(timer); timer=null; }
+}
+
+async function refreshSync(){
+  const r = await fetch('/api/sync'); const j = await r.json();
+  const box = document.getElementById('syncbox');
+  const stale = j.stale ? ' <span class="badge b-ERROR">STALE 已过期(保留上次成功状态)</span>' : '';
+  box.innerHTML = `
+    <div><b>轮询状态</b> ${badge(j.poll_state)}${stale}</div>
+    <div><b>最近轮询</b> ${fmtTs(j.last_poll_at)}</div>
+    <div><b>最近成功快照</b> ${fmtTs(j.last_success_at)}</div>
+    <div><b>本地最新版本</b> ${j.local_latest ?? '—'}</div>
+    <div><b>站牌实际生效版本</b> ${j.sign_effective_version ?? '—'}</div>
+    <div><b>是否一致</b> ${j.in_sync ? badge('CONFIRMED') : badge('PENDING')}</div>
+    <div><b>待推送数</b> ${j.pending_push_count}</div>
+    <div><b>站牌可达</b> ${j.sign_reachable ? '✅' : '❌（不阻塞采集）'}</div>
+    <div><b>站牌观测时间</b> ${fmtTs(j.sign_observed_at)}</div>
+    <div><b>header_ts</b> ${j.latest_header_ts ?? '—'} (${j.latest_header_ts ? new Date(j.latest_header_ts*1000).toISOString() : '—'})</div>
+    <div style="grid-column:1/-1"><b>最近错误</b> <span class="mono">${esc(j.last_error || '无')} @ ${fmtTs(j.last_error_at)}</span></div>`;
+  box.parentElement.classList.toggle('stale', !!j.stale);
+
+  document.querySelector('#snaptbl tbody').innerHTML = (j.snapshots||[]).map(s =>
+    `<tr><td>${s.version}</td><td>${s.applied?'✅':'❌'}</td><td class="mono">${fmtTs(s.header_ts)}</td><td>${s.entity_count}</td><td>${s.ignored_count}</td><td class="mono">${esc(s.reject_reason||'')}</td><td class="mono">${fmtTs(s.received_at)}</td></tr>`).join('') || '<tr><td colspan=7 class="muted">无</td></tr>';
+  document.querySelector('#pushtbl tbody').innerHTML = (j.push_attempts||[]).map(p =>
+    `<tr><td>${p.id}</td><td>${p.version}</td><td>${badge(p.status)}</td><td>${p.http_status??'—'}</td><td class="mono">${esc(p.idem_key)}</td><td class="mono">${esc(p.error||'')}</td><td class="mono">${fmtTs(p.updated_at)}</td></tr>`).join('') || '<tr><td colspan=7 class="muted">无</td></tr>';
+}
+
+async function refreshTrips(){
+  const r = await fetch('/api/trips'); const j = await r.json();
+  const head = document.getElementById('triphead');
+  const box = document.getElementById('trips');
+  if(!j.service_date){ head.textContent='尚未上传计划 CSV。'; box.innerHTML=''; return; }
+  head.innerHTML = `服务日 <b>${j.service_date}</b>，共 ${j.trips.length} 个班次` +
+    (j.realtime_pending ? ' · <span class="badge b-PENDING">尚无成功快照，全部待定</span>' : '');
+  box.innerHTML = j.trips.map(t => `
+    <details ${t.cancelled ? '' : 'open'} style="margin-bottom:6px">
+      <summary>班次 <span class="mono">${esc(t.trip_id)}</span> ${t.cancelled?'<span class="trip-cancel">整班取消 CANCELED</span>':''}</summary>
+      <table><thead><tr><th>站序</th><th>站号</th><th>计划时刻(UTC)</th><th>状态</th><th>预计到达(绝对)</th><th>预计发车(绝对)</th><th>不确定度(s)</th><th>实时依据版本</th></tr></thead>
+      <tbody>${t.stops.map(s => `<tr>
+        <td>${s.stop_sequence}</td><td class="mono">${esc(s.stop_code)}</td><td class="mono">${esc(s.scheduled_time)}</td>
+        <td>${badge(s.status)}</td><td class="mono">${esc(s.arrival_iso||'—')}</td><td class="mono">${esc(s.departure_iso||'—')}</td>
+        <td>${s.uncertainty??'—'}</td><td>${s.realtime_version??'—'}</td></tr>`).join('')}</tbody></table>
+    </details>`).join('');
+}
+
+function refreshAll(){ refreshSync(); refreshTrips(); }
+refreshAll();
+</script>
+</body>
+</html>
