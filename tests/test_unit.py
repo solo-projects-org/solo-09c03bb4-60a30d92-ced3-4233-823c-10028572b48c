@@ -157,7 +157,7 @@ def test_snapshot_revokes_missing_trip_to_pending(storage):
     t1_rows = [r for r in all_rows if r["trip_id"] == "T1"]
     assert t1_rows[0]["arrival_time"] == 1200
 
-    payload = build_payload(storage, storage.latest_applied_snapshot()["version"])
+    payload = build_payload(storage, storage.get_desired_version())
     t2 = next(t for t in payload["trips"] if t["trip_id"] == "T2")
     assert t2["cancelled"] is False
     assert t2["stops"][0]["status"] == ST_PENDING
@@ -171,14 +171,16 @@ def test_superseded_attempts_and_cancel_payload(storage):
     storage.replace_schedule("2026-11-16", [
         {"trip_id": "T1", "stop_sequence": 1, "stop_code": "A",
          "scheduled_time": "2026-11-16T08:00:00Z"}])
+    # The plan upload itself is desired-state v1; each applied snapshot
+    # bumps the same monotonic counter the sign sees.
+    assert storage.get_desired_version() == 1
     storage.apply_snapshot(1, "h1", [], 0)
     storage.apply_snapshot(2, "h2", [
         {"trip_id": "T1", "cancelled": True, "stops": []}], 0)
     attempts = storage.get_push_attempts()
     statuses = {a["version"]: a["status"] for a in attempts}
-    assert statuses[1] == "SUPERSEDED"
-    assert statuses[2] == "PENDING"
-    payload = build_payload(storage, 2)
+    assert statuses == {1: "SUPERSEDED", 2: "SUPERSEDED", 3: "PENDING"}
+    payload = build_payload(storage, 3)
     assert payload["trips"][0]["cancelled"] is True
     assert payload["trips"][0]["stops"][0]["status"] == ST_CANCELLED
 
@@ -193,13 +195,13 @@ def test_skipped_stop_status(storage):
         {"trip_id": "T1", "cancelled": False, "stops": [
             {"stop_sequence": 2, "arrival": None, "departure": None,
              "uncertainty": None, "sched_rel": "SKIPPED"}]}], 0)
-    payload = build_payload(storage, 1)
+    payload = build_payload(storage, storage.get_desired_version())
     stops = {s["stop_sequence"]: s for s in payload["trips"][0]["stops"]}
     assert stops[1]["status"] == ST_PENDING
     assert stops[2]["status"] == ST_SKIPPED
 
 
-def test_replace_schedule_resets_everything(storage):
+def test_replace_schedule_resets_realtime_and_enqueues_plan_push(storage):
     storage.replace_schedule("2026-11-16", [
         {"trip_id": "T1", "stop_sequence": 1, "stop_code": "A",
          "scheduled_time": "2026-11-16T08:00:00Z"}])
@@ -209,4 +211,82 @@ def test_replace_schedule_resets_everything(storage):
          "scheduled_time": "2026-11-17T08:00:00Z"}])
     assert storage.get_service_date() == "2026-11-17"
     assert storage.latest_applied_snapshot() is None
-    assert storage.get_push_attempts() == []
+    # Realtime state is reset, but the corrected plan itself is enqueued
+    # as the newest desired state so it reaches the sign without waiting
+    # for a new realtime snapshot.
+    attempts = storage.get_push_attempts()
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "PENDING"
+    assert attempts[0]["idem_key"].startswith("plan-")
+    # The desired-state version is monotonic across plan replacements.
+    assert attempts[0]["version"] == storage.get_desired_version() == 3
+    summary = storage.get_sync_summary()
+    assert summary["desired_kind"] == "plan"
+    assert summary["rt_version"] is None and summary["latest_header_ts"] is None
+    # No collection success is faked for the plan-only state.
+    assert summary["poll_state"] == "NO_DATA"
+    assert summary["last_success_at"] is None
+
+
+def test_migration_from_pre_upgrade_volume(tmp_path):
+    """Old data volumes keep working: the desired-version counter is
+    seeded above anything the sign may already have received, and the
+    new payload_json column is added in place."""
+    import sqlite3 as _sql
+
+    db = str(tmp_path / "old.db")
+    conn = _sql.connect(db)
+    # Schema as it existed before the upgrade (no payload_json column).
+    conn.executescript("""
+    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE schedule (trip_id TEXT NOT NULL, stop_sequence INTEGER NOT NULL,
+        stop_code TEXT NOT NULL, scheduled_time TEXT NOT NULL,
+        PRIMARY KEY (trip_id, stop_sequence));
+    CREATE TABLE rt_state (trip_id TEXT PRIMARY KEY, version INTEGER NOT NULL,
+        header_ts INTEGER NOT NULL, cancelled INTEGER NOT NULL DEFAULT 0,
+        route_id TEXT, direction_id INTEGER, trip_start_time TEXT,
+        updated_at REAL NOT NULL);
+    CREATE TABLE rt_stop (trip_id TEXT NOT NULL, stop_sequence INTEGER NOT NULL,
+        arrival_time INTEGER, departure_time INTEGER, uncertainty INTEGER,
+        sched_rel TEXT, PRIMARY KEY (trip_id, stop_sequence));
+    CREATE TABLE snapshot (version INTEGER PRIMARY KEY AUTOINCREMENT,
+        header_ts INTEGER NOT NULL, body_hash TEXT NOT NULL,
+        applied INTEGER NOT NULL, reject_reason TEXT,
+        entity_count INTEGER NOT NULL, ignored_count INTEGER NOT NULL DEFAULT 0,
+        received_at REAL NOT NULL);
+    CREATE TABLE push_attempt (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        version INTEGER NOT NULL, idem_key TEXT NOT NULL UNIQUE,
+        content_hash TEXT NOT NULL, status TEXT NOT NULL, http_status INTEGER,
+        error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+    """)
+    for i, ts in enumerate((1000, 2000, 3000), start=1):
+        conn.execute(
+            "INSERT INTO snapshot(header_ts, body_hash, applied, entity_count,"
+            " received_at) VALUES (?,?,1,0,?)", (ts, f"h{i}", float(i)))
+    conn.execute(
+        "INSERT INTO push_attempt(version, idem_key, content_hash, status,"
+        " created_at, updated_at) VALUES (3,'snap-3-abc','h3','CONFIRMED',3.0,3.0)")
+    conn.execute("INSERT INTO meta(key,value) VALUES('service_date','2026-11-16')")
+    conn.commit()
+    conn.close()
+
+    from webapp.storage import Storage
+
+    s = Storage(db)  # migration runs here
+    try:
+        # Seeded above anything the sign may already serve (v3).
+        assert s.get_desired_version() == 3
+        s.replace_schedule("2026-11-16", [
+            {"trip_id": "T1", "stop_sequence": 1, "stop_code": "A",
+             "scheduled_time": "2026-11-16T08:00:00Z"}])
+        attempt = s.get_push_attempts()[0]
+        # Strictly newer than any pre-upgrade push: never rejected by the
+        # sign's monotonic guard.
+        assert attempt["version"] == 4
+        claimed = s.claim_next_push()
+        assert claimed["payload_json"] is not None
+        import json as _json
+
+        assert _json.loads(claimed["payload_json"])["version"] == 4
+    finally:
+        s.close()

@@ -76,12 +76,12 @@
     <div class="flex2">
       <div>
         <details open><summary>快照历史（拒绝/应用）</summary>
-          <table id="snaptbl"><thead><tr><th>版本</th><th>应用</th><th>header_ts(UTC)</th><th>实体</th><th>忽略</th><th>原因</th><th>接收时间</th></tr></thead><tbody></tbody></table>
+          <table id="snaptbl"><thead><tr><th>快照版本</th><th>应用</th><th>header_ts(UTC)</th><th>实体</th><th>忽略</th><th>原因</th><th>接收时间</th></tr></thead><tbody></tbody></table>
         </details>
       </div>
       <div>
         <details open><summary>推送尝试（含丢回执/重试）</summary>
-          <table id="pushtbl"><thead><tr><th>ID</th><th>版本</th><th>状态</th><th>HTTP</th><th>幂等键</th><th>错误</th><th>更新时间</th></tr></thead><tbody></tbody></table>
+          <table id="pushtbl"><thead><tr><th>ID</th><th>推送版本</th><th>状态</th><th>HTTP</th><th>幂等键</th><th>内容哈希</th><th>实时依据header_ts</th><th>错误</th><th>更新时间</th></tr></thead><tbody></tbody></table>
         </details>
       </div>
     </div>
@@ -115,7 +115,7 @@ async function uploadCsv(){
     const r = await fetch('/api/schedule', {method:'POST', body:fd});
     const j = await r.json();
     if(!r.ok) throw new Error(j.detail || r.status);
-    msg.className=''; msg.innerHTML = `✅ 已载入服务日 <b>${j.service_date}</b>，${j.row_count} 行 / ${j.trip_count} 个班次，旧实时与推送状态已重置。`;
+    msg.className=''; msg.innerHTML = `✅ 已载入服务日 <b>${j.service_date}</b>，${j.row_count} 行 / ${j.trip_count} 个班次。旧实时与推送状态已重置；新计划的完整待定明细已成为待同步版本 v${j.desired_version}，无需等待新实时快照即会推送站牌。`;
     refreshAll();
   }catch(e){ msg.className='err'; msg.textContent='❌ '+e.message; }
 }
@@ -138,11 +138,15 @@ async function refreshSync(){
   const r = await fetch('/api/sync'); const j = await r.json();
   const box = document.getElementById('syncbox');
   const stale = j.stale ? ' <span class="badge b-ERROR">STALE 已过期(保留上次成功状态)</span>' : '';
+  const basis = j.desired_kind === 'plan'
+    ? '新计划待定明细（无实时依据，未冒充采集成功）'
+    : (j.desired_kind === 'snapshot' ? `实时快照 header_ts=${j.latest_header_ts}` : '—');
   box.innerHTML = `
     <div><b>轮询状态</b> ${badge(j.poll_state)}${stale}</div>
     <div><b>最近轮询</b> ${fmtTs(j.last_poll_at)}</div>
     <div><b>最近成功快照</b> ${fmtTs(j.last_success_at)}</div>
-    <div><b>本地最新版本</b> ${j.local_latest ?? '—'}</div>
+    <div><b>本地最新版本(待同步)</b> ${j.local_latest ?? '—'}</div>
+    <div><b>待同步内容依据</b> ${esc(basis)}</div>
     <div><b>站牌实际生效版本</b> ${j.sign_effective_version ?? '—'}</div>
     <div><b>是否一致</b> ${j.in_sync ? badge('CONFIRMED') : badge('PENDING')}</div>
     <div><b>待推送数</b> ${j.pending_push_count}</div>
@@ -155,7 +159,7 @@ async function refreshSync(){
   document.querySelector('#snaptbl tbody').innerHTML = (j.snapshots||[]).map(s =>
     `<tr><td>${s.version}</td><td>${s.applied?'✅':'❌'}</td><td class="mono">${fmtTs(s.header_ts)}</td><td>${s.entity_count}</td><td>${s.ignored_count}</td><td class="mono">${esc(s.reject_reason||'')}</td><td class="mono">${fmtTs(s.received_at)}</td></tr>`).join('') || '<tr><td colspan=7 class="muted">无</td></tr>';
   document.querySelector('#pushtbl tbody').innerHTML = (j.push_attempts||[]).map(p =>
-    `<tr><td>${p.id}</td><td>${p.version}</td><td>${badge(p.status)}</td><td>${p.http_status??'—'}</td><td class="mono">${esc(p.idem_key)}</td><td class="mono">${esc(p.error||'')}</td><td class="mono">${fmtTs(p.updated_at)}</td></tr>`).join('') || '<tr><td colspan=7 class="muted">无</td></tr>';
+    `<tr><td>${p.id}</td><td>${p.version}</td><td>${badge(p.status)}</td><td>${p.http_status??'—'}</td><td class="mono">${esc(p.idem_key)}</td><td class="mono">${esc(p.content_hash_short||'—')}</td><td class="mono">${p.payload_header_ts??'—'}</td><td class="mono">${esc(p.error||'')}</td><td class="mono">${fmtTs(p.updated_at)}</td></tr>`).join('') || '<tr><td colspan=9 class="muted">无</td></tr>';
 }
 
 async function refreshTrips(){

@@ -69,12 +69,16 @@ async def upload_schedule(
         inferred_date, rows = parse_schedule_csv(text, date)
     except ScheduleError as exc:
         raise HTTPException(400, str(exc)) from exc
-    count = get_storage().replace_schedule(inferred_date, rows)
+    storage = get_storage()
+    count = storage.replace_schedule(inferred_date, rows)
     return {
         "ok": True,
         "service_date": inferred_date,
         "row_count": count,
         "trip_count": len({r["trip_id"] for r in rows}),
+        # The corrected plan is now the newest desired state; the pusher
+        # syncs its full PENDING detail without waiting for a snapshot.
+        "desired_version": storage.get_desired_version(),
     }
 
 
@@ -84,20 +88,16 @@ async def trips():
     s = get_storage()
     if s.get_service_date() is None:
         return {"service_date": None, "trips": []}
+    desired = s.get_desired_version()
     latest = s.latest_applied_snapshot()
-    if latest is None:
-        # No successful snapshot yet: every scheduled stop is PENDING.
-        payload = build_payload(s, 0)
-        return {
-            "service_date": s.get_service_date(),
-            "trips": payload["trips"],
-            "realtime_pending": True,
-        }
-    payload = build_payload(s, latest["version"])
+    payload = build_payload(s, desired)
     return {
         "service_date": s.get_service_date(),
         "trips": payload["trips"],
-        "realtime_pending": False,
+        # No applied snapshot yet (e.g. right after a plan correction):
+        # every stop is PENDING and no collection success is implied.
+        "realtime_pending": latest is None,
+        "desired_version": desired or None,
     }
 
 
@@ -155,11 +155,16 @@ async def sync_status():
             or summary["last_error_at"] > summary["last_success_at"]
         )
     )
-    summary["local_latest"] = summary["latest_version"]
+    # 待同步 vs 实际生效: local newest desired state vs what the sign
+    # was last observed to serve.
+    summary["local_latest"] = summary["desired_version"]
     summary["sign_effective_version"] = summary["sign_observed_version"]
+    summary["realtime_pending"] = (
+        s.get_service_date() is not None and summary["rt_version"] is None
+    )
     summary["in_sync"] = (
-        summary["latest_version"] is not None
-        and summary["sign_observed_version"] == summary["latest_version"]
+        summary["desired_version"] is not None
+        and summary["sign_observed_version"] == summary["desired_version"]
         and summary["pending_push_count"] == 0
     )
     summary["last_snapshot"] = dict(latest) if latest else None

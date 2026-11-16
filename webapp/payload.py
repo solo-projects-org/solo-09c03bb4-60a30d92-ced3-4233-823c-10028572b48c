@@ -38,7 +38,16 @@ def derive_stop_status(row: dict) -> str:
     return ST_PENDING
 
 
-def build_payload(storage: Storage, version: int) -> dict:
+def build_payload(
+    storage: Storage, version: int, idem_key: str | None = None
+) -> dict:
+    """Full desired sign state for desired-state ``version``.
+
+    The content explicitly carries its realtime basis (``rt_version`` /
+    ``header_ts`` of the applied snapshot, both ``None`` right after a plan
+    upload) so the sent content, its hash and the sign's receipt always
+    describe the same plan + realtime basis.
+    """
     rows = storage.get_trip_rows()
     trips: dict[str, dict] = {}
     for row in rows:
@@ -68,12 +77,15 @@ def build_payload(storage: Storage, version: int) -> dict:
         t["stops"].sort(key=lambda s: s["stop_sequence"])
 
     snap = storage.latest_applied_snapshot()
-    attempt = storage.get_attempt(version)
+    if idem_key is None:
+        attempt = storage.get_attempt(version)
+        idem_key = attempt["idem_key"] if attempt else f"v{version}"
     # Keep the payload deterministic: no wall-clock fields, otherwise two
     # pushes of the same state would hash differently and break idempotency.
     payload = {
         "version": version,
-        "idempotency_key": attempt["idem_key"] if attempt else f"snap-{version}",
+        "idempotency_key": idem_key,
+        "rt_version": snap["version"] if snap else None,
         "header_ts": snap["header_ts"] if snap else None,
         "service_date": storage.get_service_date(),
         "trips": trip_list,

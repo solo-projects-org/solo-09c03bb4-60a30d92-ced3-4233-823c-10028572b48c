@@ -50,6 +50,7 @@ async function load(){
     <div class="meta">
       <span>生效版本 <b>${j.version}</b></span>
       <span>header_ts <b class="mono">${j.header_ts ?? '—'}</b></span>
+      <span>实时依据 <b>${j.rt_version ? '快照 v'+j.rt_version : (j.header_ts ? '快照(旧格式)' : '无（计划待定明细）')}</b></span>
       <span>服务日 <b>${j.service_date ?? '—'}</b></span>
       <span>幂等键 <b class="mono">${esc(j._idempotency_key)}</b></span>
       <span>内容哈希 <b class="mono">${esc((j.content_hash||'').slice(0,16))}…</b></span>

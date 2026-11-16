@@ -9,15 +9,26 @@ Design notes
 * A *snapshot version* is a monotonically increasing integer assigned every
   time a full GTFS-RT snapshot is observed. Applied snapshots replace the
   whole realtime state in one transaction.
+* A *desired-state version* (``meta['desired_version']``) is a monotonically
+  increasing integer bumped every time the content the sign should serve
+  changes — an applied snapshot **or a plan upload**. It is the version the
+  sign sees, so a corrected plan is pushed immediately without waiting for
+  a new realtime snapshot, and a late old push can never roll the sign back
+  (versions never go backwards, even across plan replacements).
 * Trips absent from an applied snapshot simply have no ``rt_state`` row, so
   the schedule/rt LEFT JOIN renders them as PENDING — this is how
   "revoked realtime status -> 待定" is expressed without extra flags.
-* Push attempts carry a stable idempotency key and the content hash of the
-  full detail payload, allowing reconciliation after lost receipts,
-  restarts and concurrent pushes.
+* Push attempts carry a stable idempotency key, the content hash and the
+  frozen payload JSON of the full detail payload. The payload is built and
+  stored **atomically at claim time** (same lock/transaction as the
+  PENDING -> IN_FLIGHT transition), so the sent content, its hash and the
+  receipt always describe the same plan + realtime basis, even if the plan
+  is replaced while a push is in flight. This is what makes reconciliation
+  after lost receipts, restarts and concurrent pushes safe.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -69,6 +80,7 @@ CREATE TABLE IF NOT EXISTS push_attempt (
     version     INTEGER NOT NULL,
     idem_key    TEXT NOT NULL UNIQUE,
     content_hash TEXT NOT NULL,
+    payload_json TEXT,
     status      TEXT NOT NULL,
     http_status INTEGER,
     error       TEXT,
@@ -96,7 +108,39 @@ class Storage:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Upgrade pre-existing data volumes in place (no schema reset).
+
+        * ``push_attempt.payload_json`` was added later; old rows keep NULL
+          and get their payload frozen lazily at claim time.
+        * ``meta['desired_version']`` is the monotonic version the sign
+          sees. On old volumes pushes used the snapshot version, so seed the
+          counter above anything the sign may already have received —
+          monotonicity across the upgrade is preserved.
+        """
+        cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(push_attempt)")
+        }
+        if "payload_json" not in cols:
+            self._conn.execute(
+                "ALTER TABLE push_attempt ADD COLUMN payload_json TEXT"
+            )
+        if self.get_meta("desired_version") is None:
+            row = self._conn.execute(
+                "SELECT MAX(v) AS m FROM ("
+                "  SELECT MAX(version) AS v FROM snapshot"
+                "  UNION ALL SELECT MAX(version) FROM push_attempt"
+                ")"
+            ).fetchone()
+            seed = int(row["m"] or 0)
+            self._conn.execute(
+                "INSERT INTO meta(key,value) VALUES('desired_version',?)",
+                (str(seed),),
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -119,9 +163,36 @@ class Storage:
     def get_service_date(self) -> str | None:
         return self.get_meta("service_date")
 
+    def get_desired_version(self) -> int:
+        """Current desired-state version (0 = nothing enqueued yet)."""
+        return int(self.get_meta("desired_version", "0") or 0)
+
+    @staticmethod
+    def _bump_desired(cur: sqlite3.Connection) -> int:
+        """Advance the monotonic desired-state version inside a transaction."""
+        row = cur.execute(
+            "SELECT value FROM meta WHERE key='desired_version'"
+        ).fetchone()
+        version = int(row[0]) + 1 if row else 1
+        cur.execute(
+            "INSERT INTO meta(key,value) VALUES('desired_version',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(version),),
+        )
+        return version
+
     # -------------------------------------------------------------- schedule
     def replace_schedule(self, service_date: str, rows: Iterable[dict]) -> int:
-        """Atomically load a new service day and reset all derived state."""
+        """Atomically load a new service day and reset all derived state.
+
+        The reset also enqueues a push attempt for the *new plan itself*
+        (all stops PENDING, no realtime basis): a corrected plan must reach
+        the sign without waiting for the next realtime snapshot. The
+        monotonic desired-state version and the last sign observation are
+        kept, so a late old push/receipt can neither roll the sign back nor
+        confirm the new plan, and the UI keeps showing what the sign
+        actually serves until the new push lands.
+        """
         rows = list(rows)
         with self._lock:
             cur = self._conn
@@ -132,7 +203,16 @@ class Storage:
                 cur.execute("DELETE FROM push_attempt")
                 cur.execute("DELETE FROM snapshot")
                 cur.execute("DELETE FROM schedule")
-                cur.execute("DELETE FROM meta")
+                # Keep the monotonic version counter and the sign
+                # observation (the sign still serves whatever it serves);
+                # reset everything else so no stale success is implied.
+                cur.execute(
+                    "DELETE FROM meta WHERE key NOT IN ("
+                    " 'desired_version',"
+                    " 'sign_reachable', 'sign_observed_at',"
+                    " 'sign_observed_version', 'sign_observed_hash',"
+                    " 'sign_observation_detail')"
+                )
                 cur.executemany(
                     "INSERT INTO schedule(trip_id, stop_sequence, stop_code, "
                     "scheduled_time) VALUES(?,?,?,?)",
@@ -157,6 +237,20 @@ class Storage:
                 cur.execute(
                     "INSERT INTO meta(key,value) VALUES('push_state',?)",
                     ("IDLE",),
+                )
+                cur.execute(
+                    "INSERT INTO meta(key,value) VALUES('desired_kind',?)",
+                    ("plan",),
+                )
+                # The corrected plan itself becomes the newest desired
+                # state; its payload (full PENDING detail) is frozen when
+                # the attempt is claimed.
+                version = self._bump_desired(cur)
+                now = time.time()
+                cur.execute(
+                    "INSERT INTO push_attempt(version, idem_key, content_hash,"
+                    " status, created_at, updated_at) VALUES(?,?,?,?,?,?)",
+                    (version, f"plan-{version}", "", P_PENDING, now, now),
                 )
                 cur.commit()
             except Exception:
@@ -263,16 +357,20 @@ class Storage:
                     "WHERE status IN (?,?,?)",
                     (P_SUPERSEDED, now, P_PENDING, P_IN_FLIGHT, P_FAILED),
                 )
-                idem_key = f"snap-{version}-{body_hash[:12]}"
+                # The sign-facing version is the monotonic desired-state
+                # version, not the snapshot version: plan replacements bump
+                # the same counter, so a late old push is always rejected.
+                desired = self._bump_desired(db)
+                db.execute(
+                    "INSERT INTO meta(key,value) VALUES('desired_kind',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    ("snapshot",),
+                )
+                idem_key = f"snap-{desired}-{body_hash[:12]}"
                 db.execute(
                     "INSERT INTO push_attempt(version, idem_key, content_hash,"
                     " status, created_at, updated_at) VALUES(?,?,?,?,?,?)",
-                    (version, idem_key, body_hash, P_PENDING, now, now),
-                )
-                db.execute(
-                    "INSERT INTO meta(key,value) VALUES('latest_version',?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (version,),
+                    (desired, idem_key, "", P_PENDING, now, now),
                 )
                 db.execute(
                     "INSERT INTO meta(key,value) VALUES('poll_state',?) "
@@ -326,6 +424,14 @@ class Storage:
             self._conn.commit()
 
     def claim_next_push(self) -> sqlite3.Row | None:
+        """Claim the newest PENDING attempt and freeze its payload.
+
+        The payload is built and persisted in the same transaction as the
+        PENDING -> IN_FLIGHT transition, so the content that will be sent,
+        its stored content hash and the eventual receipt all describe the
+        same plan + realtime basis — even if the plan is replaced or a new
+        snapshot is applied while the push is in flight.
+        """
         with self._lock:
             db = self._conn
             row = db.execute(
@@ -335,6 +441,24 @@ class Storage:
             ).fetchone()
             if row is None:
                 return None
+            if row["payload_json"] is None:
+                # Deferred import: payload.py imports this module's Storage
+                # for typing, so a module-level import would be circular.
+                from .payload import build_payload
+
+                payload = build_payload(
+                    self, row["version"], idem_key=row["idem_key"]
+                )
+                db.execute(
+                    "UPDATE push_attempt SET payload_json=?, content_hash=?, "
+                    "updated_at=? WHERE id=?",
+                    (
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                        payload["content_hash"],
+                        time.time(),
+                        row["id"],
+                    ),
+                )
             db.execute(
                 "UPDATE push_attempt SET status=?, updated_at=? WHERE id=?",
                 (P_IN_FLIGHT, time.time(), row["id"]),
@@ -344,25 +468,41 @@ class Storage:
                 "SELECT * FROM push_attempt WHERE id=?", (row["id"],)
             ).fetchone()
 
-    def mark_push_confirmed(self, attempt_id: int, http_status: int) -> None:
+    def mark_push_confirmed(self, attempt_id: int, http_status: int) -> bool:
+        """Confirm an in-flight attempt.
+
+        Returns False when the attempt no longer exists or is no longer
+        in flight (plan replaced / superseded meanwhile): a late receipt
+        must never confirm a plan it does not belong to.
+        """
         with self._lock:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "UPDATE push_attempt SET status=?, http_status=?, "
-                "error=NULL, updated_at=? WHERE id=?",
-                (P_CONFIRMED, http_status, time.time(), attempt_id),
+                "error=NULL, updated_at=? WHERE id=? AND status=?",
+                (P_CONFIRMED, http_status, time.time(), attempt_id, P_IN_FLIGHT),
             )
             self._conn.commit()
+            return cur.rowcount > 0
 
     def mark_push_failed(
         self, attempt_id: int, http_status: int | None, error: str
-    ) -> None:
+    ) -> bool:
+        """Mark an in-flight attempt failed (same guard as confirmation)."""
         with self._lock:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "UPDATE push_attempt SET status=?, http_status=?, error=?, "
-                "updated_at=? WHERE id=?",
-                (P_FAILED, http_status, error[:500], time.time(), attempt_id),
+                "updated_at=? WHERE id=? AND status=?",
+                (
+                    P_FAILED,
+                    http_status,
+                    error[:500],
+                    time.time(),
+                    attempt_id,
+                    P_IN_FLIGHT,
+                ),
             )
             self._conn.commit()
+            return cur.rowcount > 0
 
     def requeue_failed(self) -> None:
         with self._lock:
@@ -386,14 +526,6 @@ class Storage:
             "SELECT * FROM push_attempt WHERE version=? ORDER BY id DESC LIMIT 1",
             (version,),
         ).fetchone()
-
-    def update_attempt_content_hash(self, attempt_id: int, content_hash: str) -> None:
-        with self._lock:
-            self._conn.execute(
-                "UPDATE push_attempt SET content_hash=?, updated_at=? WHERE id=?",
-                (content_hash, time.time(), attempt_id),
-            )
-            self._conn.commit()
 
     def record_sign_observation(
         self,
@@ -456,12 +588,26 @@ class Storage:
         ]
 
     def get_push_attempts(self) -> list[dict]:
-        return [
+        rows = [
             dict(r)
             for r in self._conn.execute(
                 "SELECT * FROM push_attempt ORDER BY id DESC LIMIT 50"
             ).fetchall()
         ]
+        for r in rows:
+            # Expose the frozen basis (not the whole payload) so the UI can
+            # show that content, hash and receipt belong together.
+            payload_json = r.pop("payload_json", None)
+            r["content_hash_short"] = (r.get("content_hash") or "")[:12] or "—"
+            r["payload_header_ts"] = None
+            if payload_json:
+                try:
+                    r["payload_header_ts"] = json.loads(payload_json).get(
+                        "header_ts"
+                    )
+                except Exception:
+                    pass
+        return rows
 
     def get_sync_summary(self) -> dict:
         m = {r["key"]: r["value"] for r in self._conn.execute("SELECT * FROM meta")}
@@ -470,13 +616,20 @@ class Storage:
             "SELECT COUNT(*) c FROM push_attempt WHERE status IN (?,?)",
             (P_PENDING, P_IN_FLIGHT),
         ).fetchone()["c"]
+        desired = int(m.get("desired_version", "0") or 0)
         return {
             "poll_state": m.get("poll_state", "NO_DATA"),
             "last_poll_at": _maybe_float(m.get("last_poll_at")),
             "last_success_at": _maybe_float(m.get("last_success_at")),
             "last_error_at": _maybe_float(m.get("last_error_at")),
             "last_error": m.get("last_error", ""),
-            "latest_version": int(latest["version"]) if latest else None,
+            # Local newest = newest desired state (plan upload or snapshot).
+            "latest_version": desired or None,
+            "desired_version": desired or None,
+            "desired_kind": m.get("desired_kind"),
+            # Realtime basis of the desired content (None = plan only,
+            # every stop PENDING, no collection success implied).
+            "rt_version": latest["version"] if latest else None,
             "latest_header_ts": latest["header_ts"] if latest else None,
             "pending_push_count": pending,
             "sign_reachable": m.get("sign_reachable") == "1",

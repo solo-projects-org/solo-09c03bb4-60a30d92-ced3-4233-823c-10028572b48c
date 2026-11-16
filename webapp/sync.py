@@ -10,19 +10,20 @@ Two independent asyncio loops with different failure semantics:
   confirms it. Pushing failures never block polling. Before every push
   it checks what the sign actually serves and reconciles lost receipts;
   the sign itself rejects stale versions so a late old push can never
-  roll its state back.
+  roll its state back. The payload is frozen when the attempt is claimed,
+  so content, hash and receipt always belong to the same desired state.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 
 import httpx
 
 from .config import Settings
 from .gtfs_rt import SnapshotParseError, parse_snapshot
-from .payload import build_payload
 from .storage import Storage
 
 
@@ -168,17 +169,6 @@ class Pusher:
             content_hash=content_hash,
             detail=f"站牌当前 version={version}",
         )
-        # After a crash the attempt may still carry the raw snapshot hash
-        # (the payload hash is normally attached right before sending).
-        # Rebuild it deterministically so hash reconciliation can match.
-        if version is not None:
-            attempt = s.get_attempt(version)
-            if attempt is not None:
-                payload = build_payload(s, version)
-                if attempt["content_hash"] != payload["content_hash"]:
-                    s.update_attempt_content_hash(
-                        attempt["id"], payload["content_hash"]
-                    )
         return {"reachable": True, "version": version, "content_hash": content_hash}
 
     # ------------------------------------------------------------- one cycle
@@ -192,11 +182,9 @@ class Pusher:
         if attempt is None:
             return {"outcome": "nothing_to_push"}
         version = attempt["version"]
-        payload = build_payload(s, version)
-        # Store the actual payload hash so reconciliation can match it.
-        if attempt["content_hash"] != payload["content_hash"]:
-            s.update_attempt_content_hash(attempt["id"], payload["content_hash"])
-            attempt = s.get_attempt(version)
+        # The payload was frozen at claim time: content, hash and receipt
+        # describe the same plan + realtime basis by construction.
+        payload = json.loads(attempt["payload_json"])
 
         try:
             resp = await client.post(
@@ -217,14 +205,32 @@ class Pusher:
             return {"outcome": "push_error", "error": str(exc)}
 
         if resp.status_code in (200, 201, 204):
-            s.mark_push_confirmed(attempt["id"], resp.status_code)
+            # The receipt must correspond to what was sent: a 2xx echoing a
+            # different version is not a confirmation of this attempt.
+            echoed_version = None
+            echoed_hash = None
             with contextlib.suppress(Exception):
                 body = resp.json()
-                s.record_sign_observation(
-                    True, body.get("version", version),
-                    body.get("content_hash", payload["content_hash"]),
-                    detail="推送回执确认",
+                echoed_version = body.get("version")
+                echoed_hash = body.get("content_hash")
+            if echoed_version is not None and echoed_version != version:
+                s.mark_push_failed(
+                    attempt["id"], resp.status_code,
+                    f"回执版本不符: 发送 v{version} 回执 v{echoed_version}",
                 )
+                await self.reconcile(client)
+                return {"outcome": "receipt_mismatch", "version": version}
+            confirmed = s.mark_push_confirmed(attempt["id"], resp.status_code)
+            s.record_sign_observation(
+                True,
+                echoed_version if echoed_version is not None else version,
+                echoed_hash or payload["content_hash"],
+                detail="推送回执确认",
+            )
+            if not confirmed:
+                # A newer desired state superseded/replaced this attempt
+                # while the push was in flight; its own attempt will push.
+                return {"outcome": "superseded", "version": version}
             return {"outcome": "confirmed", "version": version}
 
         if resp.status_code == 409:

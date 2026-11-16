@@ -37,7 +37,9 @@ python -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
   `trip_id|班次`、`stop_sequence|站序`、`stop_code|站号`、`scheduled_time|计划时刻|计划时间`
 * 计划时刻（UTC）支持：`HH:MM[:SS]`（按服务日解释）、ISO-8601（`...Z` 或带偏移）、epoch 秒
 * 编码支持 UTF-8（含 BOM）与 GB18030
-* 重新上传会**原子重置**当日全部实时状态、快照与推送记录
+* 重新上传会**原子重置**当日全部实时状态、快照与推送记录，并**立即把新计划本身
+  （完整待定明细）登记为最新待同步版本**——无需等待新实时快照即推送站牌；该计划推送
+  不冒充采集成功（轮询状态保持 `NO_DATA`、无成功时间），也不妨碍后来的有效快照应用。
 
 示例见 `examples/schedule_sample.csv`。
 
@@ -54,18 +56,27 @@ python -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
    `STALE 已过期` 红标。
 4. **迟到快照不能回退**：以 `header.timestamp` 为准，非递增（≤ 已应用版本）的快照
    记为 rejected，结果不变；快照表里能看到拒绝原因。
-5. **完整明细推送 + 本地/站牌版本区分**：推送载荷是当日全部班次逐站明细的**完整期望
-   状态**，带单调 `version`、`idempotency_key` 与规范 JSON `content_hash`。网页同步卡片
-   分别显示「本地最新版本」与「站牌实际生效版本」。
-6. **丢回执 / 并发 / 重启后可核实接续**：
+5. **完整明细推送 + 单调期望版本**：推送载荷是当日全部班次逐站明细的**完整期望
+   状态**。站牌看到的 `version` 是单调递增的**期望状态版本**——每次应用快照**或
+   上传/更正计划**都会使其 +1，因此计划更正本身就是最新待同步内容，旧推送版本
+   永远小于新版本、不可能回退站牌。载荷显式携带实时依据（`rt_version` /
+   `header_ts`，纯计划推送为 `null`），带稳定 `idempotency_key` 与规范 JSON
+   `content_hash`。网页同步卡片分别显示「本地最新版本（待同步）」与「站牌实际
+   生效版本」。
+6. **内容/摘要/回执同源**：推送载荷在**认领尝试的同一事务**中构建并冻结
+   （`payload_json` + `content_hash` 随尝试落库）。即使在途推送期间计划被替换，
+   已发出的内容、其哈希与回执也始终对应同一份计划和实时依据；旧回执只会确认
+   它自己的那次尝试（确认按 `IN_FLIGHT` 守卫），绝不能确认新计划。
+7. **丢回执 / 并发 / 重启后可核实接续**：
    * 站牌**先落库后回包**；回执丢失（HTTP500/挂起）时数据已持久。
    * 每次推送前先 `GET /state` **对账**：站牌已在提供同版本同哈希内容时，把本地
      IN_FLIGHT/FAILED 尝试按哈希确认，无需重复推送。
    * 同版本同幂等键重放为幂等 no-op；`claim_next_push` 用事务保证并发只有一个在途。
-   * 应用重启把残留 IN_FLIGHT 尝试标记为 FAILED（结果未知），由对账确认或幂等重试接续。
-7. **迟到旧推送不能回退站牌**：站牌对 `version < 当前版本` 的 POST 一律 `409` 拒绝。
-8. **站牌离线不阻塞采集**：推送与轮询是两个独立循环；推送失败只记 FAILED 并重试，
-   轮询照常推进，站牌恢复后自动追到最新版本。
+   * 应用重启把残留 IN_FLIGHT 尝试标记为 FAILED（结果未知），由对账确认或幂等重试
+     接续；在上传、发送、确认之间退出都不会丢更正。
+8. **迟到旧推送不能回退站牌**：站牌对 `version < 当前版本` 的 POST 一律 `409` 拒绝。
+9. **站牌离线不阻塞采集**：上传只是本地事务；推送与轮询是两个独立循环；推送失败
+   只记 FAILED 并重试，轮询照常推进，站牌恢复后自动追到最新版本。
 
 ## 四、场景操作手册（curl）
 
@@ -98,6 +109,12 @@ curl -X POST localhost:8000/api/push-now       # 立即推送一次
 curl        localhost:8000/api/sync            # 同步状态/快照历史/推送尝试
 curl        localhost:8000/api/trips           # 逐站明细
 curl        localhost:8000/api/evidence/T1001  # 单班逐站依据
+
+# 5) 更正当日计划：重新上传 CSV 即可。上传响应给出新的待同步版本
+#    desired_version；无需新快照，推送循环会把新计划的完整待定明细
+#    同步到站牌（BACKGROUND_WORKERS=0 时用 /api/push-now 手动触发）。
+curl -F "file=@examples/schedule_sample.csv" -F "service_date=2026-11-16" \
+     localhost:8000/api/schedule
 ```
 
 ## 五、目录结构
@@ -107,19 +124,21 @@ webapp/            采集网页：config / storage(SQLite) / schedule_io / gtfs_
                    payload / sync(轮询+推送) / main(FastAPI) / static(前端)
 gateway/app.py     可配置慢响应与故障模式的 GTFS-RT 模拟网关
 sign/app.py        独立持久化站牌（版本守卫、幂等、丢回执模拟）+ 查看页
-tests/             24 个 pytest（单元 + 三服务进程内交错集成）
-scripts/smoke_e2e.py  真实 uvicorn 进程的端到端冒烟（24 项检查）
+tests/             35 个 pytest（单元 + 三服务进程内交错集成）
+scripts/smoke_e2e.py  真实 uvicorn 进程的端到端冒烟（36 项检查）
 docker-compose.yml Dockerfile  run_local.sh  run_smoke.sh
 ```
 
 ## 六、自测
 
 ```bash
-.venv/bin/python -m pytest -q          # 24 passed
+.venv/bin/python -m pytest -q          # 35 passed
 ./run_smoke.sh &                        # 另起终端：
 .venv/bin/python scripts/smoke_e2e.py  # ALL SMOKE CHECKS PASSED
 ```
 
 覆盖的关键交错：缺席撤销待定、解析/拉取失败保状态标过期、慢网关超时、迟到快照拒绝、
 整班取消、旧推送 409 防回退、站牌离线不阻塞采集、丢回执后对账确认、挂起后幂等重试、
-重启接续、并发推送单一在途。
+重启接续、并发推送单一在途，以及计划更正专属场景：**更正后无需新快照即同步待定明细、
+不冒充采集成功、不妨碍后续快照、在途旧推送被新版超越、旧回执不能确认新计划、
+上传/发送/确认间崩溃后重启自动核实接续、旧数据卷就地迁移（版本计数器接续）**。
